@@ -1,0 +1,16 @@
+{
+  "name": "startpage-transport-proxy",
+  "version": "1.0.0",
+  "description": "Transport and RSS proxy for a personal startpage",
+  "main": "server.js",
+  "scripts": {
+    "start": "PORT=56669 node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "fast-xml-parser": "^4.4.1"
+  }
+}
