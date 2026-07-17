@@ -49,6 +49,34 @@ Base prefix: `/api`
 ### Station departures
 `GET /api/stations/:id/departures`
 
+### Smart departures
+`GET /api/departures?query=Kroepcke&limit=6`
+
+Direct GTFS-RT stop IDs can skip the transport.rest fallback:
+`GET /api/departures?stopId=gtfs:000009028694&limit=6`
+
+The endpoint returns a stable JSON shape:
+```json
+{
+  "ok": true,
+  "source": "gtfs-rt",
+  "fallback": false,
+  "stop": { "id": "gtfs:000009028694", "name": "000009028694" },
+  "updatedAt": "2026-05-13T15:00:00.000Z",
+  "departures": [],
+  "diagnostics": { "provider": "vbn-gtfs-rt", "cache": "fresh" }
+}
+```
+
+If no live data is available, the endpoint returns a structured `ok:false`
+response. If a recent good response exists, it returns that response with
+`source: "cache"` and `stale: true`.
+
+### Transport locations
+`GET /api/transport/locations?query=Kroepcke&limit=8`
+
+Returns deduplicated location candidates with stable IDs and provider IDs.
+
 ### RSS fetch
 `GET /api/rss?url=<feed-url>`
 
@@ -67,7 +95,56 @@ Upstream requests time out after 10 seconds.
 - `/api/locations`: 30s
 - `/api/stops/:id/departures`: 8s
 - `/api/stations/:id/departures`: 8s
+- `/api/departures`: 10s
+- last good `/api/departures` response: 15m
 - `/api/rss`: 5m
+
+## GTFS-RT
+The smart departures endpoint uses the gtfs.de static and realtime feeds as a
+matching pair. VBN GTFS-Realtime and transport.rest remain fallback providers.
+
+Default gtfs.de realtime feed:
+`https://realtime.gtfs.de/realtime-free.pb`
+
+Default VBN feed:
+`http://gtfsr.vbn.de/gtfsr_connect.json`
+
+Override the feed URL:
+```sh
+GTFS_DE_REALTIME_URL=https://realtime.gtfs.de/realtime-free.pb npm start
+VBN_GTFS_RT_JSON_URL=http://gtfsr.vbn.de/gtfsr_connect.json npm start
+```
+
+For query-to-stop matching, the proxy downloads and caches the static GTFS feed,
+extracts `stops.txt`, and builds an in-memory stop index.
+
+Default static GTFS feed:
+`https://download.gtfs.de/germany/free/latest.zip`
+
+Override the static feed or cache file:
+```sh
+GTFS_STATIC_URL=https://download.gtfs.de/germany/free/latest.zip npm start
+GTFS_STATIC_CACHE_FILE=.cache/gtfs-static.zip npm start
+GTFS_HEADSIGN_CACHE_FILE=.cache/gtfs-headsigns.json npm start
+GTFS_STATIC_REFRESH_MS=86400000 npm start
+```
+
+The static ZIP is refreshed every 24 hours by default and replaced atomically.
+If a refresh fails, the last local ZIP remains available as stale fallback.
+Headsigns are cached persistently with the matching static-feed version. The
+API only waits briefly for missing headsigns so live responses stay fast while
+the background cache is being built.
+
+Run checks:
+```sh
+npm test
+npm run check
+```
+
+Configure query aliases for known GTFS stop IDs:
+```sh
+TRANSPORT_STOP_ALIASES='{"kroepcke":["000009028694"]}' npm start
+```
 
 ## Reverse proxy (Nginx)
 Use TLS termination in Nginx and proxy to `localhost:56669`.
