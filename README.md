@@ -89,7 +89,19 @@ All responses include:
 - `Access-Control-Allow-Headers: *`
 
 ## Timeouts
-Upstream requests time out after 10 seconds.
+General proxy requests time out after 10 seconds. The smart location endpoint
+uses a shorter fallback timeout so a slow transport.rest response does not block
+otherwise local GTFS matching.
+
+```sh
+LOCATION_FALLBACK_TIMEOUT_MS=1200 npm start
+```
+
+The location fallback caches successful responses for 30 seconds, empty results
+for 10 seconds, and can serve a successful response as stale for another five
+minutes when the upstream fails. These durations can be changed with
+`LOCATION_FALLBACK_CACHE_MS`, `LOCATION_FALLBACK_NEGATIVE_CACHE_MS`, and
+`LOCATION_FALLBACK_STALE_MS`.
 
 ## Caching
 - `/api/locations`: 30s

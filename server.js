@@ -22,6 +22,14 @@ const GTFS_STATIC_REFRESH_CHECK_MS =
   Number(process.env.GTFS_STATIC_REFRESH_CHECK_MS) || 60 * 60 * 1000;
 const TIMEOUT_MS = 10_000;
 const TRANSPORT_TIMEOUT_MS = 5_000;
+const LOCATION_FALLBACK_TIMEOUT_MS =
+  Number(process.env.LOCATION_FALLBACK_TIMEOUT_MS) || 1_200;
+const LOCATION_FALLBACK_CACHE_MS =
+  Number(process.env.LOCATION_FALLBACK_CACHE_MS) || 30_000;
+const LOCATION_FALLBACK_NEGATIVE_CACHE_MS =
+  Number(process.env.LOCATION_FALLBACK_NEGATIVE_CACHE_MS) || 10_000;
+const LOCATION_FALLBACK_STALE_MS =
+  Number(process.env.LOCATION_FALLBACK_STALE_MS) || 5 * 60_000;
 const VBN_TIMEOUT_MS = 5_000;
 const GTFS_DE_REALTIME_TIMEOUT_MS = 20_000;
 const GTFS_STATIC_TIMEOUT_MS = 60_000;
@@ -179,6 +187,7 @@ function sendEntry(res, entry) {
 
 function normalizeSearchText(value) {
   return String(value || "")
+    .normalize("NFC")
     .toLowerCase()
     .replace(/ä/g, "ae")
     .replace(/ö/g, "oe")
@@ -193,6 +202,10 @@ function normalizeSearchText(value) {
 
 function compactSearchText(value) {
   return normalizeSearchText(value).replace(/\s+/g, "");
+}
+
+function tokenizeSearchText(value) {
+  return normalizeSearchText(value).split(" ").filter(Boolean);
 }
 
 function parseStopAliases(value) {
@@ -332,6 +345,24 @@ function scoreLocation(location, query) {
   return Math.min(score, 1);
 }
 
+function scoreLocationWords(location, query) {
+  const locality = normalizeSearchText(getLocationLocality(location));
+  const names = [location.name, locality ? `${locality} ${location.name || ""}` : ""];
+  const score = Math.max(
+    ...names.filter(Boolean).map((name) =>
+      getGtfsStopMatch(
+        {
+          normalizedName: normalizeSearchText(name),
+          compactName: compactSearchText(name),
+          type: location.type,
+        },
+        query
+      ).score
+    )
+  );
+  return Math.min(score + (location.products && Object.values(location.products).some(Boolean) ? 0.03 : 0), 1);
+}
+
 function normalizeLocation(location, query) {
   const canonicalId = canonicalLocationId(location);
   const { lat, lon } = getLocationCoordinates(location);
@@ -368,6 +399,47 @@ function dedupeLocations(locations) {
   }
 
   return [...byKey.values()];
+}
+
+function mergeLocationsByNormalizedName(locations) {
+  const groups = new Map();
+
+  for (const location of locations) {
+    const key = normalizeSearchText(location.name);
+    if (!key) continue;
+    const existing = groups.get(key);
+    if (!existing) {
+      const gtfsIds = [...new Set(location.providerIds?.gtfs || [])];
+      groups.set(key, {
+        ...location,
+        providerIds: {
+          gtfs: gtfsIds.length > 0 ? gtfsIds : null,
+          transportRest: location.providerIds?.transportRest || null,
+        },
+      });
+      continue;
+    }
+
+    const gtfsIds = [
+      ...(existing.providerIds?.gtfs || []),
+      ...(location.providerIds?.gtfs || []),
+    ];
+    const preferred = location.score > existing.score ? location : existing;
+    groups.set(key, {
+      ...preferred,
+      id: gtfsIds.length > 0
+        ? `gtfs:${[...new Set(gtfsIds)].join(",")}`
+        : preferred.id,
+      providerIds: {
+        gtfs: gtfsIds.length > 0 ? [...new Set(gtfsIds)] : null,
+        transportRest:
+          existing.providerIds.transportRest || location.providerIds?.transportRest || null,
+      },
+      score: Math.max(existing.score, location.score),
+    });
+  }
+
+  return [...groups.values()];
 }
 
 function parseCsvLine(line) {
@@ -620,6 +692,7 @@ async function loadGtfsStopIndex() {
         stopsByToken.set(token, matches);
       }
     }
+    const sortedStopTokens = [...stopsByToken.keys()].sort();
 
     const routesById = new Map(
       parseCsv(routesText)
@@ -654,6 +727,7 @@ async function loadGtfsStopIndex() {
       stops,
       stopsByName,
       stopsByToken,
+      sortedStopTokens,
       routesById,
       tripsById,
       version: gtfsStaticVersion,
@@ -773,19 +847,77 @@ async function buildTripHeadsignCache(version) {
   return gtfsTripHeadsigns;
 }
 
-function scoreGtfsStop(stop, query, referenceLocations = []) {
+function lowerBound(values, target) {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (values[middle] < target) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function findStopsForQueryToken(index, queryToken) {
+  const exact = index.stopsByToken.get(queryToken);
+  if (queryToken.length < 4) return exact || [];
+
+  const matches = [...(exact || [])];
+  const tokens = index.sortedStopTokens || [...index.stopsByToken.keys()].sort();
+  for (let position = lowerBound(tokens, queryToken); position < tokens.length; position += 1) {
+    const token = tokens[position];
+    if (!token.startsWith(queryToken)) break;
+    if (token === queryToken) continue;
+    matches.push(...index.stopsByToken.get(token));
+  }
+  return matches;
+}
+
+function getGtfsStopMatch(stop, query) {
   const normalizedQuery = normalizeSearchText(query);
   const compactQuery = compactSearchText(query);
-  const queryParts = splitQueryParts(query);
-  let score = 0;
-
-  if (stop.normalizedName === normalizedQuery || stop.compactName === compactQuery) score += 0.75;
-  else if (stop.normalizedName.startsWith(normalizedQuery) || stop.compactName.startsWith(compactQuery)) score += 0.55;
-  else if (stop.normalizedName.includes(normalizedQuery) || stop.compactName.includes(compactQuery)) score += 0.35;
-  else {
-    const matchingParts = queryParts.filter((part) => part.length >= 3 && stop.normalizedName.includes(part));
-    score += Math.min(matchingParts.length * 0.15, 0.35);
+  if (stop.normalizedName === normalizedQuery || stop.compactName === compactQuery) {
+    return { score: 1, coverage: 1, exactTokens: tokenizeSearchText(query).length };
   }
+
+  const queryTokens = [...new Set(tokenizeSearchText(query))];
+  const stopTokens = new Set(tokenizeSearchText(stop.normalizedName));
+  if (queryTokens.length === 0) return { score: 0, coverage: 0, exactTokens: 0 };
+
+  let matchedWeight = 0;
+  let exactTokens = 0;
+  for (const queryToken of queryTokens) {
+    if (stopTokens.has(queryToken)) {
+      matchedWeight += 1;
+      exactTokens += 1;
+      continue;
+    }
+    if (
+      queryToken.length >= 4 &&
+      [...stopTokens].some((stopToken) => stopToken.startsWith(queryToken))
+    ) {
+      matchedWeight += 0.85;
+    }
+  }
+
+  const coverage = matchedWeight / queryTokens.length;
+  let score = coverage * 0.65;
+  if (coverage >= 0.84) score += 0.15;
+  if (stop.normalizedName.includes(normalizedQuery)) score += 0.1;
+  else if (stop.normalizedName.startsWith(normalizedQuery)) score += 0.07;
+  if (tokenizeSearchText(stop.normalizedName)[0] === queryTokens[0]) score += 0.05;
+  if (stop.type === "stop" || stop.type === "station") score += 0.02;
+  if (coverage < 0.6) score = Math.min(score, 0.34);
+
+  return {
+    score: Math.max(0, Math.min(score, 1)),
+    coverage,
+    exactTokens,
+  };
+}
+
+function scoreGtfsStop(stop, query, referenceLocations = []) {
+  let score = getGtfsStopMatch(stop, query).score;
 
   const distances = referenceLocations
     .map((location) => distanceMeters(stop.lat, stop.lon, location.lat, location.lon))
@@ -798,28 +930,26 @@ function scoreGtfsStop(stop, query, referenceLocations = []) {
     else score -= 0.1;
   }
 
-  if (stop.type === "stop") score += 0.05;
   return Math.max(0, Math.min(score, 1));
 }
 
-async function findGtfsLocations(query, limit, referenceLocations = []) {
-  const index = await loadGtfsStopIndex();
+function findGtfsLocationsInIndex(index, query, limit, referenceLocations = []) {
   const normalizedQuery = normalizeSearchText(query);
   const compactQuery = compactSearchText(query);
   const exactMatches = [
     ...(index.stopsByName.get(normalizedQuery) || []),
     ...(index.stopsByName.get(compactQuery) || []),
   ];
-  const queryTokenMatches = normalizedQuery.split(" ")
+  const queryTokenMatches = tokenizeSearchText(query)
     .filter((token) => token.length >= 3)
-    .map((token) => index.stopsByToken.get(token))
-    .filter(Boolean)
+    .map((token) => findStopsForQueryToken(index, token))
+    .filter((matches) => matches.length > 0)
     .sort((a, b) => a.length - b.length);
   const candidates = exactMatches.length > 0
     ? [...new Map(exactMatches.map((stop) => [stop.id, stop])).values()]
     : queryTokenMatches[0] || index.stops;
 
-  return candidates
+  const ranked = candidates
     .map((stop) => ({
       id: `gtfs:${stop.id}`,
       name: stop.name,
@@ -834,9 +964,15 @@ async function findGtfsLocations(query, limit, referenceLocations = []) {
       score: Number(scoreGtfsStop(stop, query, referenceLocations).toFixed(3)),
       raw: stop,
     }))
-    .filter((location) => location.score >= 0.35)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+    .filter((location) => location.score >= 0.6)
+    .sort((a, b) => b.score - a.score);
+
+  return mergeLocationsByNormalizedName(ranked).slice(0, limit);
+}
+
+async function findGtfsLocations(query, limit, referenceLocations = []) {
+  const index = await loadGtfsStopIndex();
+  return findGtfsLocationsInIndex(index, query, limit, referenceLocations);
 }
 
 async function fetchJson(url, cacheSeconds, timeoutMs = TRANSPORT_TIMEOUT_MS) {
@@ -917,6 +1053,84 @@ async function fetchGtfsRealtimeFeed(url, cacheSeconds, timeoutMs, forceRefresh 
 
   inflight.set(cacheKey, promise);
   return promise;
+}
+
+function createLocationFallbackClient(options = {}) {
+  const request = options.request || fetchWithTimeout;
+  const responseCache = options.cache || new Map();
+  const pendingRequests = options.inflight || new Map();
+  const currentTime = options.now || nowMs;
+  const timeoutMs = options.timeoutMs ?? LOCATION_FALLBACK_TIMEOUT_MS;
+  const cacheMs = options.cacheMs ?? LOCATION_FALLBACK_CACHE_MS;
+  const negativeCacheMs = options.negativeCacheMs ?? LOCATION_FALLBACK_NEGATIVE_CACHE_MS;
+  const staleMs = options.staleMs ?? LOCATION_FALLBACK_STALE_MS;
+
+  async function lookup(query, limit) {
+    const cacheKey = `${normalizeSearchText(query)}|limit:${limit}`;
+    const cached = responseCache.get(cacheKey);
+    if (cached && cached.expiresAt > currentTime()) {
+      return { locations: cached.locations, stale: false, cache: "fresh" };
+    }
+    if (pendingRequests.has(cacheKey)) return pendingRequests.get(cacheKey);
+
+    const promise = (async () => {
+      const searchParams = new URLSearchParams({
+        query,
+        results: String(Math.max(limit * 3, 12)),
+        stops: "true",
+        addresses: "false",
+        poi: "false",
+      });
+      const url = `${UPSTREAM_BASE}/locations?${searchParams}`;
+
+      try {
+        const response = await request(url, timeoutMs);
+        if (!response.ok) {
+          const error = new Error(`Location upstream returned HTTP ${response.status}`);
+          error.status = response.status;
+          throw error;
+        }
+        const body = await response.json();
+        const locations = Array.isArray(body)
+          ? mergeLocationsByNormalizedName(
+              dedupeLocations(body.map((location) => {
+                const normalized = normalizeLocation(location, query);
+                normalized.score = Number(scoreLocationWords(location, query).toFixed(3));
+                return normalized;
+              }))
+                .filter((location) => location.score >= 0.6)
+                .sort((a, b) => b.score - a.score)
+            ).slice(0, limit)
+          : [];
+        const expiresAt = currentTime() + (locations.length > 0 ? cacheMs : negativeCacheMs);
+        responseCache.set(cacheKey, {
+          locations,
+          expiresAt,
+          staleUntil: locations.length > 0 ? expiresAt + staleMs : expiresAt,
+        });
+        return { locations, stale: false, cache: locations.length > 0 ? "miss" : "negative" };
+      } catch (err) {
+        const stale = responseCache.get(cacheKey);
+        if (stale && stale.locations.length > 0 && stale.staleUntil > currentTime()) {
+          return { locations: stale.locations, stale: true, cache: "stale" };
+        }
+        throw err;
+      } finally {
+        pendingRequests.delete(cacheKey);
+      }
+    })();
+
+    pendingRequests.set(cacheKey, promise);
+    return promise;
+  }
+
+  return { lookup };
+}
+
+const locationFallbackClient = createLocationFallbackClient();
+
+async function findTransportLocationsResult(query, limit) {
+  return locationFallbackClient.lookup(query, limit);
 }
 
 async function findTransportLocations(query, limit) {
@@ -1610,17 +1824,48 @@ app.get("/api/transport/locations", async (req, res) => {
       console.warn(`GTFS location matching failed: ${err.message}`);
     }
 
-    const locations = gtfsLocations.length < limit
-      ? await findTransportLocations(query, limit)
-      : [];
-    res.json({
-      ok: true,
-      locations: [
-        ...aliasLocations,
-        ...gtfsLocations.map(({ raw, ...location }) => location),
-        ...locations.map(({ raw, ...location }) => location),
-      ].slice(0, limit),
-    });
+    const localLocations = mergeLocationsByNormalizedName([
+      ...aliasLocations,
+      ...gtfsLocations,
+    ]).sort((a, b) => b.score - a.score);
+    const hasUsableLocalMatch = localLocations.some((location) => location.score >= 0.75);
+
+    if (hasUsableLocalMatch) {
+      res.json({
+        ok: true,
+        locations: localLocations
+          .map(({ raw, ...location }) => location)
+          .slice(0, limit),
+      });
+      return;
+    }
+
+    try {
+      const fallback = await findTransportLocationsResult(query, limit);
+      const locations = mergeLocationsByNormalizedName([
+        ...localLocations,
+        ...fallback.locations,
+      ])
+        .sort((a, b) => b.score - a.score)
+        .map(({ raw, ...location }) => location)
+        .slice(0, limit);
+      res.json({
+        ok: true,
+        locations,
+        ...(fallback.stale ? { stale: true } : {}),
+      });
+    } catch (err) {
+      if (localLocations.length > 0) {
+        res.json({
+          ok: true,
+          locations: localLocations
+            .map(({ raw, ...location }) => location)
+            .slice(0, limit),
+        });
+        return;
+      }
+      throw err;
+    }
   } catch (err) {
     res.status(err.name === "AbortError" ? 504 : 502).json({
       ok: false,
@@ -1819,13 +2064,18 @@ module.exports = {
   _internal: {
     clampNumber,
     compactSearchText,
+    createLocationFallbackClient,
     distanceMeters,
+    findGtfsLocationsInIndex,
+    getGtfsStopMatch,
     isCacheFileFresh,
     makeDeparturesCacheKey,
     mergeDepartureAttempts,
+    mergeLocationsByNormalizedName,
     normalizeSearchText,
     parseCanonicalStopId,
     parseCsvLine,
     scoreGtfsStop,
+    tokenizeSearchText,
   },
 };
